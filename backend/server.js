@@ -18,9 +18,9 @@ const app = express();
 app.use(express.json()); // Parse JSON bodies
 app.use(express.urlencoded({ extended: true })); // Parse URL-encoded bodies
 app.use(cors({
-  origin: 'http://localhost:5173',
+  origin: ['http://localhost:5173', 'https://medulla-ai-test.vercel.app'],
   credentials: true,
-})); // Enable CORS only for localhost:5173
+})); // Enable CORS for specified origins
 
 // Routes
 app.use('/api/auth', require('./routes/authRoutes'));
