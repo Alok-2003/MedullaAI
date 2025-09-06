@@ -1,8 +1,7 @@
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import toast from 'react-hot-toast'
 import { api, endpoints } from '../api/client'
-import { io } from 'socket.io-client'
 
 export default function Canvas() {
   const [me, setMe] = useState(null)
@@ -22,7 +21,8 @@ export default function Canvas() {
   const patchesRef = useRef([])
   useEffect(() => { patchesRef.current = patches }, [patches])
 
-  // Backend + Socket bootstrap
+  // Load once (no sockets/polling): initialize patches from server (if any),
+  // and always sync to localStorage for UX-first editing.
   useEffect(() => {
     const load = async () => {
       try {
@@ -30,29 +30,24 @@ export default function Canvas() {
         const meRes = await api.get(endpoints.me)
         if (meRes?.data?.success) setMe(meRes.data.user)
 
-        // 2) Initialize board (patches only)
-        const boardRes = await api.get('/canvas')
-        if (boardRes?.data?.success && boardRes.data.board) {
-          const serverPatches = boardRes.data.board.patches || []
-          // Only initialize from server if local is empty to avoid wiping user work
-          if ((patchesRef.current?.length || 0) === 0 && serverPatches.length > 0) {
-            setPatches(serverPatches)
-          }
-        }
+        // 2) Initialize board (patches only) once
+        // Prefer server patches, but if localStorage has data, keep user's local work
+        const local = localStorage.getItem('patches')
+        let localPatches = []
+        try { localPatches = JSON.parse(local || '[]') } catch { localPatches = [] }
 
-        // 3) Connect socket for realtime
-        const SOCKET_URL = import.meta.env.VITE_API_BASE_URL || 'http://localhost:3000'
-        const s = io(SOCKET_URL, { transports: ['websocket'], withCredentials: true })
-        setSocket(s)
-        // join room per user for targeted updates
-        s.on('connect', () => {
-          const uid = meRes?.data?.user?.id || meRes?.data?.user?._id
-          if (uid) s.emit('auth:join', uid)
-        })
-        s.on('board:update', ({ patches: p }) => {
-          // Avoid wiping local state due to empty patch arrays from external updates
-          if (Array.isArray(p) && p.length > 0) setPatches(p)
-        })
+        const boardRes = await api.get('/canvas')
+        const serverPatches = boardRes?.data?.board?.patches || []
+
+        if ((localPatches?.length || 0) > 0) {
+          setPatches(localPatches)
+        } else if (serverPatches.length > 0) {
+          setPatches(serverPatches)
+          localStorage.setItem('patches', JSON.stringify(serverPatches))
+        } else {
+          // nothing yet; ensure localStorage has default empty array
+          localStorage.setItem('patches', JSON.stringify([]))
+        }
       } catch (err) {
         toast.error('Session expired, please login again')
         localStorage.removeItem('token')
@@ -62,12 +57,8 @@ export default function Canvas() {
       }
     }
     load()
-    // cleanup socket on unmount
-    return () => {
-      if (socketRef.current) {
-        socketRef.current.disconnect()
-      }
-    }
+    // no sockets to cleanup
+    return () => {}
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [navigate])
 
@@ -77,8 +68,10 @@ export default function Canvas() {
     navigate('/login')
   }
 
-  const socketRef = useRef(null)
-  const setSocket = (s) => { socketRef.current = s }
+  // Local storage sync for patches
+  const saveLocalPatches = (next) => {
+    try { localStorage.setItem('patches', JSON.stringify(next)) } catch {}
+  }
 
   // Helpers for percentages <-> pixels
   const getContainerRect = () => containerEl?.getBoundingClientRect()
@@ -98,7 +91,11 @@ export default function Canvas() {
     if (!containerEl) return toast.error('Upload an image first')
     const id = crypto.randomUUID()
     const newPatch = { id, x: 35, y: 35, w: 30, h: 20, color: '#ef4444', opacity: 0.4 }
-    setPatches((p) => [...p, newPatch])
+    setPatches((p) => {
+      const next = [...p, newPatch]
+      saveLocalPatches(next)
+      return next
+    })
     setActiveId(id)
   }
 
@@ -147,7 +144,11 @@ export default function Canvas() {
       if (!patch) return
       left = clamp(left, 0, 100 - patch.w)
       top = clamp(top, 0, 100 - patch.h)
-      setPatches((prev) => prev.map((p) => (p.id === id ? { ...p, x: left, y: top } : p)))
+      setPatches((prev) => {
+        const next = prev.map((p) => (p.id === id ? { ...p, x: left, y: top } : p))
+        saveLocalPatches(next)
+        return next
+      })
     }
     // Resizing (bottom-right handle)
     if (resizing) {
@@ -158,7 +159,11 @@ export default function Canvas() {
       if (!patch) return
       let newW = clamp(startW + dx, 5, 100 - patch.x)
       let newH = clamp(startH + dy, 5, 100 - patch.y)
-      setPatches((prev) => prev.map((p) => (p.id === id ? { ...p, w: newW, h: newH } : p)))
+      setPatches((prev) => {
+        const next = prev.map((p) => (p.id === id ? { ...p, w: newW, h: newH } : p))
+        saveLocalPatches(next)
+        return next
+      })
     }
   }
 
@@ -167,32 +172,29 @@ export default function Canvas() {
     if (resizing) setResizing(null)
   }
 
-  const updatePatch = (id, updates) => setPatches((prev) => prev.map((p) => (p.id === id ? { ...p, ...updates } : p)))
-  const removePatch = (id) => setPatches((prev) => prev.filter((p) => p.id !== id))
+  const updatePatch = (id, updates) => setPatches((prev) => {
+    const next = prev.map((p) => (p.id === id ? { ...p, ...updates } : p))
+    saveLocalPatches(next)
+    return next
+  })
+  const removePatch = (id) => setPatches((prev) => {
+    const next = prev.filter((p) => p.id !== id)
+    saveLocalPatches(next)
+    return next
+  })
 
-  // Debounced save to backend (patches only)
-  const saveTimer = useRef(null)
-  const savePatches = (nextPatches) => {
-    if (saveTimer.current) clearTimeout(saveTimer.current)
-    saveTimer.current = setTimeout(async () => {
-      try {
-        await api.put('/canvas', { patches: nextPatches })
-        // local echo handled by state, server will also emit to other sessions
-      } catch (e) {
-        // quiet fail, avoid toast spam during drag
-      }
-    }, 250)
-  }
-
-  // Trigger persistence when patches change (skip initial loading)
-  const initializedRef = useRef(false)
-  useEffect(() => {
-    if (!initializedRef.current) {
-      initializedRef.current = true
-      return
+  // Save button handler: persist localStorage patches to MongoDB
+  const saveToServer = async () => {
+    try {
+      const raw = localStorage.getItem('patches')
+      let payload = []
+      try { payload = JSON.parse(raw || '[]') } catch { payload = patches }
+      await api.put('/canvas', { patches: payload })
+      toast.success('Patches saved')
+    } catch (e) {
+      toast.error('Failed to save patches')
     }
-    savePatches(patches)
-  }, [patches])
+  }
 
   return (
     <div className="min-h-[60vh]"> 
@@ -217,6 +219,7 @@ export default function Canvas() {
                     Upload Image
                   </label>
                   <button onClick={addPatch} className="px-3 py-2 rounded-lg bg-gradient-to-r from-indigo-500 to-cyan-400 text-white disabled:opacity-50" disabled={!imageUrl}>Add Heat Patch</button>
+                  <button onClick={saveToServer} className="px-3 py-2 rounded-lg bg-white/10 hover:bg-white/15">Save</button>
                 </div>
 
                 <div
